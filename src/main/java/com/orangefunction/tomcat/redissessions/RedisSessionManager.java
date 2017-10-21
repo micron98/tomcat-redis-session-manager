@@ -1,36 +1,39 @@
 package com.orangefunction.tomcat.redissessions;
 
+import java.io.IOException;
+import java.net.ConnectException;
+import java.util.Arrays;
+import java.util.EnumSet;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Pattern;
+
 import org.apache.catalina.Lifecycle;
 import org.apache.catalina.LifecycleException;
 import org.apache.catalina.LifecycleListener;
-import org.apache.catalina.util.LifecycleSupport;
 import org.apache.catalina.LifecycleState;
 import org.apache.catalina.Loader;
-import org.apache.catalina.Valve;
 import org.apache.catalina.Session;
+import org.apache.catalina.Valve;
+import org.apache.catalina.connector.Request;
 import org.apache.catalina.session.ManagerBase;
-
-import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
-import org.apache.commons.pool2.impl.BaseObjectPoolConfig;
-
-import redis.clients.util.Pool;
-import redis.clients.jedis.JedisPool;
-import redis.clients.jedis.JedisSentinelPool;
-import redis.clients.jedis.JedisPoolConfig;
-import redis.clients.jedis.Jedis;
-import redis.clients.jedis.Protocol;
-
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.Set;
-import java.util.EnumSet;
-import java.util.HashSet;
-import java.util.Iterator;
-
+import org.apache.catalina.util.LifecycleSupport;
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
+
+import redis.clients.jedis.HostAndPort;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPool;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisSentinelPool;
+import redis.clients.jedis.Protocol;
+import redis.clients.jedis.exceptions.JedisConnectionException;
+import redis.clients.jedis.exceptions.JedisRedirectionException;
+import redis.clients.util.Pool;
 
 public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
@@ -54,13 +57,17 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
 	protected String host = "localhost";
 	protected int port = 6379;
+	protected HostAndPort originalHostAndPort;
+	protected HostAndPort defaultHostAndPort;
 	protected int database = 0;
 	protected String password = null;
 	protected int timeout = Protocol.DEFAULT_TIMEOUT;
 	protected String sentinelMaster = null;
+	protected int maxRetryCount = 5;
 	Set<String> sentinelSet = null;
 
 	protected Pool<Jedis> connectionPool;
+	protected Map<HostAndPort, Pool<Jedis>> connectionPools;
 	protected JedisPoolConfig connectionPoolConfig = new JedisPoolConfig();
 
 	protected RedisSessionHandlerValve handlerValve;
@@ -69,6 +76,8 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 	protected ThreadLocal<String> currentSessionId = new ThreadLocal<>();
 	protected ThreadLocal<Boolean> currentSessionIsPersisted = new ThreadLocal<>();
 	protected Serializer serializer;
+
+	protected Pattern ignorePattern;
 
 	protected static String name = "RedisSessionManager";
 
@@ -197,22 +206,71 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		// Do nothing.
 	}
 
-	protected Jedis acquireConnection() {
+	// protected Jedis acquireConnection() {
+	// return acquireConnection(defaultHostAndPort);
+	// }
+	//
+	protected Jedis acquireConnection(HostAndPort host) {
+		long elapsed = System.currentTimeMillis();
+		Pool<Jedis> connectionPool = connectionPools.get(host);
+		if (connectionPool == null) {
+			try {
+				connectionPool = initializeDatabaseConnection(host);
+			} catch (LifecycleException e) {
+
+				ConnectException ce = null;
+				JedisConnectionException jce = null;
+				Throwable t;
+				while ((t = e.getCause()) != null) {
+					if (t instanceof ConnectException) {
+						ce = (ConnectException) t;
+						break;
+					} else//
+					if (t instanceof JedisConnectionException) {
+						jce = (JedisConnectionException) t;
+						break;
+					}
+				}
+
+				if (ce != null || jce != null) {
+
+					// if current host and port is not the original host and port, try the original
+					// one. this may be possible when redis advised redirection and later the host
+					// become unavailable, we will need to fallback to the original
+					if (originalHostAndPort.equals(host) == false) {
+						log.warn("connection failed to " + host + ". retrying " + originalHostAndPort);
+						return acquireConnection(originalHostAndPort);
+					}
+				}
+
+				throw new IllegalStateException(e);
+			}
+		}
 		Jedis jedis = connectionPool.getResource();
 
 		if (getDatabase() != 0) {
 			jedis.select(getDatabase());
 		}
 
+		if (log.isDebugEnabled())
+			log.debug("acquireConnection(" + host + ") finished in " + (System.currentTimeMillis() - elapsed) + "ms");
+
 		return jedis;
 	}
 
-	protected void returnConnection(Jedis jedis, Boolean error) {
-		if (error) {
-			connectionPool.returnBrokenResource(jedis);
-		} else {
-			connectionPool.returnResource(jedis);
+	protected void retireCurrentPool(HostAndPort hostAndPort) {
+		Pool<Jedis> pool = connectionPools.remove(hostAndPort);
+		if (pool == null) {
+			return;
 		}
+		try {
+			pool.close();
+		} catch (Exception e) {
+		}
+	}
+
+	protected void returnConnection(Jedis jedis, Boolean error) {
+		jedis.close();
 	}
 
 	protected void returnConnection(Jedis jedis) {
@@ -272,10 +330,13 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 	protected synchronized void startInternal() throws LifecycleException {
 		super.startInternal();
 
+		originalHostAndPort = defaultHostAndPort = new HostAndPort(host, port);
+		connectionPools = new HashMap<>();
+
 		setState(LifecycleState.STARTING);
 
 		Boolean attachedToValve = false;
-		for (Valve valve : getContainer().getPipeline().getValves()) {
+		for (Valve valve : getContext().getPipeline().getValves()) {
 			if (valve instanceof RedisSessionHandlerValve) {
 				this.handlerValve = (RedisSessionHandlerValve) valve;
 				this.handlerValve.setRedisSessionManager(this);
@@ -298,11 +359,12 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 			throw new LifecycleException(e);
 		}
 
-		log.info("Will expire sessions after " + getMaxInactiveInterval() + " seconds");
+		log.info("Will expire sessions after " + (getContext().getSessionTimeout() * 60) + " seconds");
 
 		initializeDatabaseConnection();
 
-		setDistributable(true);
+		getContext().setDistributable(true);
+
 	}
 
 	/**
@@ -321,10 +383,12 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
 		setState(LifecycleState.STOPPING);
 
-		try {
-			connectionPool.destroy();
-		} catch (Exception e) {
-			// Do nothing.
+		for (Pool<Jedis> pool : connectionPools.values()) {
+			try {
+				pool.destroy();
+			} catch (Exception e) {
+				// Do nothing.
+			}
 		}
 
 		// Require a new random number generator if we are restarted
@@ -340,18 +404,42 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		Boolean error = true;
 		Jedis jedis = null;
 		try {
-			jedis = acquireConnection();
 
-			// Ensure generation of a unique session identifier.
-			if (null != requestedSessionId) {
-				sessionId = sessionIdWithJvmRoute(requestedSessionId, jvmRoute);
-				if (jedis.setnx(sessionId.getBytes(), NULL_SESSION) == 0L) {
-					sessionId = null;
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
 				}
-			} else {
-				do {
-					sessionId = sessionIdWithJvmRoute(generateSessionId(), jvmRoute);
-				} while (jedis.setnx(sessionId.getBytes(), NULL_SESSION) == 0L); // 1 = key set; 0 = key already existed
+				if (jedis != null) {
+					returnConnection(jedis);
+				}
+				jedis = acquireConnection(defaultHostAndPort);
+				try {
+					// Ensure generation of a unique session identifier.
+					if (null != requestedSessionId) {
+						sessionId = sessionIdWithJvmRoute(requestedSessionId, jvmRoute);
+						if (jedis.setnx(sessionId.getBytes(), NULL_SESSION) == 0L) {
+							sessionId = null;
+						}
+					} else {
+						do {
+							sessionId = sessionIdWithJvmRoute("redis-" + generateSessionId(), jvmRoute);
+						} while (jedis.setnx(sessionId.getBytes(), NULL_SESSION) == 0L); // 1 = key set; 0 = key already
+					}
+					break;
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
 			}
 
 			/*
@@ -369,7 +457,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 				session.setNew(true);
 				session.setValid(true);
 				session.setCreationTime(System.currentTimeMillis());
-				session.setMaxInactiveInterval(getMaxInactiveInterval());
+				session.setMaxInactiveInterval(getContext().getSessionTimeout() * 60);
 				session.setId(sessionId);
 				session.tellNew();
 			}
@@ -421,6 +509,18 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		}
 	}
 
+	protected String getCurrentRequestURI() {
+		Request request = RedisSessionHandlerValve.getCurrentRequest();
+		if (request == null) {
+			return "";
+		}
+		StringBuilder requestURI = new StringBuilder(request.getRequestURI());
+		// if (request.getQueryString() != null) {
+		// requestURI.append("?").append(request.getQueryString());
+		// }
+		return requestURI.toString();
+	}
+
 	@Override
 	public Session findSession(String id) throws IOException {
 		RedisSession session = null;
@@ -433,7 +533,17 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		} else if (id.equals(currentSessionId.get())) {
 			session = currentSession.get();
 		} else {
-			byte[] data = loadSessionDataFromRedis(id);
+
+			byte[] data = null;
+
+			String requestURI = getCurrentRequestURI();
+			if (ignorePattern != null && ignorePattern.matcher(requestURI.toString()).matches()) {
+				log.debug("requestURI[" + requestURI + "] matches ignore pattern. returning null session");
+				data = null;
+			} else {
+				data = loadSessionDataFromRedis(id);
+			}
+
 			if (data != null) {
 				DeserializedSessionContainer container = sessionFromSerializedData(id, data);
 				session = container.session;
@@ -456,9 +566,33 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		Jedis jedis = null;
 		Boolean error = true;
 		try {
-			jedis = acquireConnection();
-			jedis.flushDB();
-			error = false;
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
+				}
+				try {
+					if (jedis != null) {
+						returnConnection(jedis);
+					}
+					jedis = acquireConnection(defaultHostAndPort);
+					jedis.flushDB();
+					error = false;
+					break;
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
+			}
 		} finally {
 			if (jedis != null) {
 				returnConnection(jedis, error);
@@ -470,10 +604,33 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		Jedis jedis = null;
 		Boolean error = true;
 		try {
-			jedis = acquireConnection();
-			int size = jedis.dbSize().intValue();
-			error = false;
-			return size;
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
+				}
+				try {
+					if (jedis != null) {
+						returnConnection(jedis);
+					}
+					jedis = acquireConnection(defaultHostAndPort);
+					int size = jedis.dbSize().intValue();
+					error = false;
+					return size;
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
+			}
 		} finally {
 			if (jedis != null) {
 				returnConnection(jedis, error);
@@ -485,10 +642,33 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		Jedis jedis = null;
 		Boolean error = true;
 		try {
-			jedis = acquireConnection();
-			Set<String> keySet = jedis.keys("*");
-			error = false;
-			return keySet.toArray(new String[keySet.size()]);
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
+				}
+				try {
+					if (jedis != null) {
+						returnConnection(jedis);
+					}
+					jedis = acquireConnection(defaultHostAndPort);
+					Set<String> keySet = jedis.keys("*");
+					error = false;
+					return keySet.toArray(new String[keySet.size()]);
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
+			}
 		} finally {
 			if (jedis != null) {
 				returnConnection(jedis, error);
@@ -503,9 +683,34 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		try {
 			log.trace("Attempting to load session " + id + " from Redis");
 
-			jedis = acquireConnection();
-			byte[] data = jedis.get(id.getBytes());
-			error = false;
+			byte[] data = null;
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
+				}
+				if (jedis != null) {
+					returnConnection(jedis);
+				}
+				jedis = acquireConnection(defaultHostAndPort);
+				try {
+					data = jedis.get(id.getBytes());
+					error = false;
+					break;
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
+			}
 
 			if (data == null) {
 				log.trace("Session " + id + " not found in Redis");
@@ -537,7 +742,7 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
 			session.setId(id);
 			session.setNew(false);
-			session.setMaxInactiveInterval(getMaxInactiveInterval());
+			session.setMaxInactiveInterval(getContext().getSessionTimeout() * 60);
 			session.access();
 			session.setValid(true);
 			session.resetDirtyTracking();
@@ -565,76 +770,107 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		Jedis jedis = null;
 		Boolean error = true;
 
+		long elapsed = System.currentTimeMillis();
+
 		try {
-			jedis = acquireConnection();
-			error = saveInternal(jedis, session, forceSave);
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
+				}
+				if (jedis != null) {
+					returnConnection(jedis);
+				}
+				jedis = acquireConnection(defaultHostAndPort);
+				try {
+					error = saveInternal(jedis, session, forceSave);
+					break;
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
+			}
 		} catch (IOException e) {
 			throw e;
 		} finally {
 			if (jedis != null) {
 				returnConnection(jedis, error);
 			}
+			if (log.isDebugEnabled())
+				log.debug("save finished in " + (System.currentTimeMillis() - elapsed) + "ms");
 		}
 	}
 
 	protected boolean saveInternal(Jedis jedis, Session session, boolean forceSave) throws IOException {
-		Boolean error = true;
+		boolean error = true;
 
-		try {
-			log.trace("Saving session " + session + " into Redis");
-
-			RedisSession redisSession = (RedisSession) session;
-
-			if (log.isTraceEnabled()) {
-				log.trace("Session Contents [" + redisSession.getId() + "]:");
-				Enumeration en = redisSession.getAttributeNames();
-				while (en.hasMoreElements()) {
-					log.trace("  " + en.nextElement());
-				}
+		for (int retryCount = 0;; retryCount++) {
+			if (retryCount >= maxRetryCount) {
+				throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
 			}
+			try {
+				log.trace("Saving session " + session + " into Redis");
 
-			byte[] binaryId = redisSession.getId().getBytes();
+				RedisSession redisSession = (RedisSession) session;
 
-			Boolean isCurrentSessionPersisted;
-			SessionSerializationMetadata sessionSerializationMetadata = currentSessionSerializationMetadata.get();
-			byte[] originalSessionAttributesHash = sessionSerializationMetadata.getSessionAttributesHash();
-			byte[] sessionAttributesHash = null;
-			if (forceSave || redisSession.isDirty()
-					|| null == (isCurrentSessionPersisted = this.currentSessionIsPersisted.get())
-					|| !isCurrentSessionPersisted || !Arrays.equals(originalSessionAttributesHash,
-							(sessionAttributesHash = serializer.attributesHashFrom(redisSession)))) {
-
-				log.trace("Save was determined to be necessary");
-
-				if (null == sessionAttributesHash) {
-					sessionAttributesHash = serializer.attributesHashFrom(redisSession);
+				if (log.isTraceEnabled()) {
+					log.trace("Session Contents [" + redisSession.getId() + "]:");
+					Enumeration en = redisSession.getAttributeNames();
+					while (en.hasMoreElements()) {
+						log.trace("  " + en.nextElement());
+					}
 				}
 
-				SessionSerializationMetadata updatedSerializationMetadata = new SessionSerializationMetadata();
-				updatedSerializationMetadata.setSessionAttributesHash(sessionAttributesHash);
+				byte[] binaryId = redisSession.getId().getBytes();
 
-				jedis.set(binaryId, serializer.serializeFrom(redisSession, updatedSerializationMetadata));
+				Boolean isCurrentSessionPersisted;
+				SessionSerializationMetadata sessionSerializationMetadata = currentSessionSerializationMetadata.get();
+				byte[] originalSessionAttributesHash = sessionSerializationMetadata.getSessionAttributesHash();
+				byte[] sessionAttributesHash = null;
+				if (forceSave || redisSession.isDirty()
+						|| null == (isCurrentSessionPersisted = this.currentSessionIsPersisted.get())
+						|| !isCurrentSessionPersisted || !Arrays.equals(originalSessionAttributesHash,
+								(sessionAttributesHash = serializer.attributesHashFrom(redisSession)))) {
 
-				redisSession.resetDirtyTracking();
-				currentSessionSerializationMetadata.set(updatedSerializationMetadata);
-				currentSessionIsPersisted.set(true);
-			} else {
-				log.trace("Save was determined to be unnecessary");
+					log.trace("Save was determined to be necessary");
+
+					if (null == sessionAttributesHash) {
+						sessionAttributesHash = serializer.attributesHashFrom(redisSession);
+					}
+
+					SessionSerializationMetadata updatedSerializationMetadata = new SessionSerializationMetadata();
+					updatedSerializationMetadata.setSessionAttributesHash(sessionAttributesHash);
+
+					jedis.set(binaryId, serializer.serializeFrom(redisSession, updatedSerializationMetadata));
+
+					redisSession.resetDirtyTracking();
+					currentSessionSerializationMetadata.set(updatedSerializationMetadata);
+					currentSessionIsPersisted.set(true);
+				} else {
+					log.trace("Save was determined to be unnecessary");
+				}
+
+				log.trace("Setting expire timeout on session [" + redisSession.getId() + "] to "
+						+ (getContext().getSessionTimeout() * 60));
+				jedis.expire(binaryId, (getContext().getSessionTimeout() * 60));
+
+				error = false;
+
+				return error;
+			} catch (Exception e) {
+				log.error(e.getMessage());
+				throw e;
+			} finally {
 			}
-
-			log.trace(
-					"Setting expire timeout on session [" + redisSession.getId() + "] to " + getMaxInactiveInterval());
-			jedis.expire(binaryId, getMaxInactiveInterval());
-
-			error = false;
-
-			return error;
-		} catch (IOException e) {
-			log.error(e.getMessage());
-
-			throw e;
-		} finally {
-			return error;
 		}
 	}
 
@@ -651,9 +887,32 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		log.trace("Removing session ID : " + session.getId());
 
 		try {
-			jedis = acquireConnection();
-			jedis.del(session.getId());
-			error = false;
+			for (int retryCount = 0;; retryCount++) {
+				if (retryCount >= maxRetryCount) {
+					throw new RuntimeException("too many retries. failed after " + maxRetryCount + " retries");
+				}
+				if (jedis != null) {
+					returnConnection(jedis);
+				}
+				jedis = acquireConnection(defaultHostAndPort);
+				try {
+					jedis.del(session.getId());
+					error = false;
+				} catch (JedisRedirectionException e) {
+					defaultHostAndPort = e.getTargetNode();
+					log.info("redirected to " + defaultHostAndPort + ". updated as default");
+					continue;
+				} catch (Exception e) {
+					retireCurrentPool(defaultHostAndPort);
+					if (defaultHostAndPort.equals(originalHostAndPort) == false) {
+						defaultHostAndPort = originalHostAndPort;
+						log.warn("trying to recover error by trying " + originalHostAndPort, e);
+						continue;
+					} else {
+						throw e;
+					}
+				}
+			}
 		} finally {
 			if (jedis != null) {
 				returnConnection(jedis, error);
@@ -690,24 +949,40 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 		// Do nothing.
 	}
 
-	private void initializeDatabaseConnection() throws LifecycleException {
+	private Pool<Jedis> initializeDatabaseConnection() throws LifecycleException {
+		return initializeDatabaseConnection(defaultHostAndPort);
+	}
+
+	private Pool<Jedis> initializeDatabaseConnection(String host, int port) throws LifecycleException {
+		return initializeDatabaseConnection(new HostAndPort(host, port));
+	}
+
+	private Pool<Jedis> initializeDatabaseConnection(HostAndPort hostAndPort) throws LifecycleException {
+		long elapsed = System.currentTimeMillis();
 		try {
 			if (getSentinelMaster() != null) {
 				Set<String> sentinelSet = getSentinelSet();
 				if (sentinelSet != null && sentinelSet.size() > 0) {
 					connectionPool = new JedisSentinelPool(getSentinelMaster(), sentinelSet, this.connectionPoolConfig,
 							getTimeout(), getPassword());
+					connectionPools.put(hostAndPort, connectionPool);
 				} else {
 					throw new LifecycleException(
 							"Error configuring Redis Sentinel connection pool: expected both `sentinelMaster` and `sentiels` to be configured");
 				}
 			} else {
-				connectionPool = new JedisPool(this.connectionPoolConfig, getHost(), getPort(), getTimeout(),
-						getPassword());
+				connectionPool = new JedisPool(this.connectionPoolConfig, hostAndPort.getHost(), hostAndPort.getPort(),
+						getTimeout(), getPassword());
+				connectionPools.put(hostAndPort, connectionPool);
 			}
+			return connectionPool;
 		} catch (Exception e) {
 			e.printStackTrace();
 			throw new LifecycleException("Error connecting to Redis", e);
+		} finally {
+			if (log.isDebugEnabled())
+				log.debug("initializeDatabaseConnection(" + hostAndPort + ") finished in "
+						+ (System.currentTimeMillis() - elapsed) + "ms");
 		}
 	}
 
@@ -877,6 +1152,24 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle {
 
 	public void setJmxNamePrefix(String jmxNamePrefix) {
 		this.connectionPoolConfig.setJmxNamePrefix(jmxNamePrefix);
+	}
+
+	public int getMaxRetryCount() {
+		return maxRetryCount;
+	}
+
+	public void setMaxRetryCount(int maxRetryCount) {
+		this.maxRetryCount = maxRetryCount;
+	}
+
+	public Pattern getIgnorePattern() {
+		return ignorePattern;
+	}
+
+	public void setIgnorePattern(String ignorePattern) {
+		if (ignorePattern != null && ignorePattern.isEmpty() == false) {
+			this.ignorePattern = Pattern.compile(ignorePattern);
+		}
 	}
 }
 

@@ -1,11 +1,11 @@
 package com.orangefunction.tomcat.redissessions;
 
+import java.io.IOException;
 import java.security.Principal;
+import java.util.HashMap;
+
 import org.apache.catalina.Manager;
 import org.apache.catalina.session.StandardSession;
-import java.util.HashMap;
-import java.io.IOException;
-
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
 
