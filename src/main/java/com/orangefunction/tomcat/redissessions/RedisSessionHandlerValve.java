@@ -27,6 +27,7 @@ public class RedisSessionHandlerValve extends ValveBase {
 	@Override
 	public void invoke(Request request, Response response) throws IOException, ServletException {
 		REQUEST.set(request);
+		// System.out.println(request.getRequestURI());
 		try {
 			getNext().invoke(request, response);
 		} finally {

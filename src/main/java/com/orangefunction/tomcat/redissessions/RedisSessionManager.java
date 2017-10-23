@@ -796,6 +796,8 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle, Runna
 
 	public byte[] loadSessionDataFromRedis(String id) throws IOException {
 
+		// System.err.println("load " + id);
+
 		long elapsed = System.currentTimeMillis();
 
 		Jedis jedis = null;
@@ -841,8 +843,9 @@ public class RedisSessionManager extends ManagerBase implements Lifecycle, Runna
 
 			return data;
 		} finally {
-			log.info("load sessionid[" + id + "] data=[" + (data == null ? "null" : String.valueOf(data.length)) + "] "
-					+ (System.currentTimeMillis() - elapsed) + "ms");
+			if (log.isDebugEnabled())
+				log.debug("load sessionid[" + id + "] data=[" + (data == null ? "null" : String.valueOf(data.length))
+						+ "] " + (System.currentTimeMillis() - elapsed) + "ms");
 
 			if (jedis != null) {
 				returnConnection(jedis, error);
